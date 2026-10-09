@@ -1,0 +1,240 @@
+name: Build toolchain
+
+on:
+  workflow_dispatch:
+    inputs:
+      toolchain-ref:
+        description: "riscv-gnu-toolchain tag, branch or commit to build"
+        type: string
+        default: ""
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+env:
+  # Upstream release that is built unless workflow_dispatch overrides it.
+  TOOLCHAIN_REF: "2026.08.27"
+  INSTALL_ROOT: /opt/riscv
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}-${{ matrix.abi }}-${{ matrix.libc }}${{ matrix.multilib && '-multilib' || '' }}
+    # Oldest hosted image, so the host binaries need no newer glibc than 2.35.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        # Add a row per toolchain. libc is one of: musl, glibc, newlib.
+        # multilib: true builds upstream's default set of arch/abi variants
+        # (glibc and newlib only); arch and abi are then the defaults that
+        # apply when no -march/-mabi is given.
+        include:
+          - arch: rv32ima
+            abi: ilp32
+            libc: musl
+          # glibc without the compressed extension.
+          - arch: rv32ima
+            abi: ilp32
+            libc: glibc
+          - arch: rv64ima
+            abi: lp64
+            libc: glibc
+          # - arch: rv64gc
+          #   abi: lp64d
+          #   libc: glibc
+          #   multilib: true
+    steps:
+      - name: Derive toolchain names
+        id: names
+        env:
+          ARCH: ${{ matrix.arch }}
+          ABI: ${{ matrix.abi }}
+          LIBC: ${{ matrix.libc }}
+          MULTILIB: ${{ matrix.multilib || false }}
+        run: |
+          case "$ARCH" in
+            rv32*) XLEN=32 ;;
+            rv64*) XLEN=64 ;;
+            *) echo "::error::arch must start with rv32 or rv64: $ARCH"; exit 1 ;;
+          esac
+          # Make target of riscv-gnu-toolchain and the target tuple it produces.
+          case "$LIBC" in
+            musl)   MAKE_TARGET=musl;   TUPLE="riscv${XLEN}-unknown-linux-musl" ;;
+            glibc)  MAKE_TARGET=linux;  TUPLE="riscv${XLEN}-unknown-linux-gnu" ;;
+            newlib) MAKE_TARGET=newlib; TUPLE="riscv${XLEN}-unknown-elf" ;;
+            *) echo "::error::unsupported libc: $LIBC"; exit 1 ;;
+          esac
+          NAME="riscv${XLEN}-${ARCH}-${ABI}-${LIBC}"
+          CONFIGURE_FLAGS=""
+          if [ "$MULTILIB" = true ]; then
+            # Upstream only rejects this when musl is the default make target,
+            # otherwise it silently builds a single variant.
+            if [ "$LIBC" = musl ]; then
+              echo "::error::multilib is not supported for musl"; exit 1
+            fi
+            NAME="${NAME}-multilib"
+            CONFIGURE_FLAGS="--enable-multilib"
+          fi
+          {
+            echo "xlen=${XLEN}"
+            echo "make-target=${MAKE_TARGET}"
+            echo "tuple=${TUPLE}"
+            echo "name=${NAME}"
+            echo "configure-flags=${CONFIGURE_FLAGS}"
+            echo "prefix=${INSTALL_ROOT}/${NAME}"
+            echo "tarball=${NAME}-x86_64-linux.tar.xz"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out riscv-gnu-toolchain
+        uses: actions/checkout@v6
+        with:
+          repository: riscv-collab/riscv-gnu-toolchain
+          ref: ${{ inputs.toolchain-ref || env.TOOLCHAIN_REF }}
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /opt/hostedtoolcache /usr/local/lib/android \
+            /usr/local/.ghcup /usr/share/swift /usr/share/dotnet
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake autotools-dev curl python3 \
+            python3-pip python3-tomli libmpc-dev libmpfr-dev libgmp-dev gawk \
+            build-essential bison flex texinfo gperf libtool patchutils bc \
+            zlib1g-dev libexpat-dev git libzstd-dev libncurses-dev qemu-user
+
+      - name: Fetch sources
+        env:
+          LIBC: ${{ matrix.libc }}
+        run: |
+          # The Makefile would clone these on demand; doing it here keeps
+          # network failures out of the build step and allows a retry.
+          for i in 1 2 3; do
+            git submodule update --init --depth 1 -j 4 binutils gcc gdb "$LIBC" && exit 0
+            echo "submodule checkout failed (attempt ${i}), retrying in $((i * 30))s"
+            sleep $((i * 30))
+          done
+          exit 1
+
+      - name: Configure
+        env:
+          PREFIX: ${{ steps.names.outputs.prefix }}
+          ARCH: ${{ matrix.arch }}
+          ABI: ${{ matrix.abi }}
+          CONFIGURE_FLAGS: ${{ steps.names.outputs.configure-flags }}
+        run: |
+          sudo mkdir -p "$PREFIX"
+          sudo chown "$(id -u):$(id -g)" "$PREFIX"
+          ./configure --prefix="$PREFIX" --with-arch="$ARCH" --with-abi="$ABI" $CONFIGURE_FLAGS
+
+      - name: Build
+        run: make -j "$(nproc)" ${{ steps.names.outputs.make-target }}
+
+      - name: Smoke test
+        env:
+          PREFIX: ${{ steps.names.outputs.prefix }}
+          TUPLE: ${{ steps.names.outputs.tuple }}
+          XLEN: ${{ steps.names.outputs.xlen }}
+          ARCH: ${{ matrix.arch }}
+          LIBC: ${{ matrix.libc }}
+          MULTILIB: ${{ matrix.multilib || false }}
+        run: |
+          export PATH="$PREFIX/bin:$PATH"
+          "$TUPLE-gcc" -v
+          cd "$RUNNER_TEMP"
+          printf '#include <stdio.h>\nint main(void) { puts("hello from C"); return 0; }\n' > hello.c
+          printf '#include <iostream>\nint main() { std::cout << "hello from C++\\n"; }\n' > hello.cc
+          # One line per variant: "<dir>;@march=...@mabi=...", "." being the default.
+          "$TUPLE-gcc" -print-multi-lib | tee multilib.txt
+          if [ "$MULTILIB" = true ] && [ "$(wc -l < multilib.txt)" -lt 2 ]; then
+            echo "::error::multilib build produced a single variant"; exit 1
+          fi
+          while IFS=';' read -r dir flags <&3; do
+            flags="${flags//@/ -}"
+            march="$(printf '%s\n' $flags | sed -n 's/^-march=//p')"
+            march="${march:-$ARCH}"
+            case "$march" in
+              rv32*) xlen=32 ;;
+              *) xlen=64 ;;
+            esac
+            echo "::group::${dir}${flags}"
+            "$TUPLE-gcc" -O2 -static $flags -o hello-c hello.c
+            "$TUPLE-g++" -O2 -static $flags -o hello-cxx hello.cc
+            "$TUPLE-readelf" -h hello-c | tee header.txt
+            "$TUPLE-readelf" -A hello-c
+            grep -q "Class: *ELF${xlen}" header.txt
+            grep -q "Machine: *RISC-V" header.txt
+            base="${march%%_*}"
+            # A static link pulls in the libraries, so this also catches a
+            # libc or libgcc that was built with compressed instructions.
+            if [[ "${base#rv??}" != *c* && "$march" != *_zc* ]] && grep -q "RVC" header.txt; then
+              echo "::error::${march} binary contains compressed code"; exit 1
+            fi
+            if [ "$LIBC" = newlib ]; then
+              echo "not run: bare-metal binaries need a board or proxy kernel"
+            elif [[ "${base#rv??}" == *v* || "$march" == *_zv* ]]; then
+              echo "not run: the runner's qemu-user predates the vector extension"
+            else
+              "qemu-riscv${xlen}" ./hello-c | grep -qx "hello from C"
+              "qemu-riscv${xlen}" ./hello-cxx | grep -qx "hello from C++"
+            fi
+            echo "::endgroup::"
+          done 3< multilib.txt
+
+      - name: Package
+        env:
+          PREFIX: ${{ steps.names.outputs.prefix }}
+          NAME: ${{ steps.names.outputs.name }}
+          TARBALL: ${{ steps.names.outputs.tarball }}
+        run: |
+          # Strip host executables only; target libraries keep their symbols.
+          find "$PREFIX" -type f -exec sh -c \
+            'file -b "$1" | grep -q "^ELF.*x86-64" && strip --strip-unneeded "$1"' _ {} \;
+          du -sh "$PREFIX"
+          # Extract with: sudo tar -xJf <tarball> -C /opt/riscv
+          XZ_OPT="-T0" tar -cJf "$RUNNER_TEMP/$TARBALL" -C "$INSTALL_ROOT" "$NAME"
+          cd "$RUNNER_TEMP" && sha256sum "$TARBALL" > "$TARBALL.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.names.outputs.name }}
+          path: |
+            ${{ runner.temp }}/${{ steps.names.outputs.tarball }}
+            ${{ runner.temp }}/${{ steps.names.outputs.tarball }}.sha256
+          compression-level: 0
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download toolchains
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/* --title "$TAG" \
+            --notes "Built from riscv-gnu-toolchain ${TOOLCHAIN_REF}. Extract with \`sudo tar -xJf <tarball> -C ${INSTALL_ROOT}\`."
